@@ -141,6 +141,134 @@ async function ensureBrowser() {
   return page!;
 }
 
+async function extractDom(page: Page): Promise<string> {
+  return await page.evaluate(() => {
+    function uniqueId(): () => string {
+      let id = 0
+      return () => {
+        id++;
+        return id.toString();
+      }
+    }
+
+    function cleanupDom(element: any, window: any, idFunc: () => string, currentSlotElement = null): { compressedElement: any } {
+      if (element instanceof window.Text) {
+        const node = {
+          type: "text",
+          text: element.textContent?.replace(/\s+/g, ' ').trim(),
+        };
+
+        return {
+          compressedElement: node,
+        };
+      }
+
+      const elementId = idFunc();
+      const attributes: Array<{ name: string, value: string }> = [];
+      attributes.push({ name: "_id", value: elementId });
+
+      if (
+        element.tagName === "STYLE" ||
+        element.tagName === "SCRIPT" ||
+        element.tagName === "NOSCRIPT" ||
+        element.tagName === "LINK" ||
+        element.tagName === "META" ||
+        element.tagName === "HEAD" ||
+        element.tagName === "CODE" ||
+        element.tagName === "SVG" ||
+        element.getAttribute("type") === "hidden" ||
+        element.getAttribute("disabled") === "true" ||
+        element.getAttribute("aria-hidden") === "true"
+      ) {
+        return {
+          compressedElement: null,
+        };
+      }
+
+      if (element.assignedSlot && element.assignedSlot !== currentSlotElement) {
+        return {
+          compressedElement: null,
+        };
+      }
+
+      if (element.tagName === "IFRAME") {
+        throw new Error("IFRAME not supported");
+      }
+
+      let compressedChildren: { compressedElement: any }[] = [];
+      let childNodes = [...element.childNodes, ...(element.shadowRoot?.childNodes ?? [])];
+
+      if (element.tagName === "SLOT" && "assignedNodes" in element && typeof element.assignedNodes === "function") {
+        childNodes.push(...element.assignedNodes());
+      }
+
+      childNodes.forEach(child => {
+        if (child instanceof window.Text || child instanceof window.HTMLElement) {
+          const compressedChild = cleanupDom(child, window, idFunc, element.tagName === "SLOT" ? element : currentSlotElement);
+          if (compressedChild.compressedElement) {
+            compressedChildren.push(compressedChild.compressedElement);
+          }
+        }
+      });
+
+      let value: string | number | null = null;
+
+      if (
+        element instanceof window.HTMLButtonElement ||
+        element instanceof window.HTMLInputElement ||
+        element instanceof window.HTMLTextAreaElement ||
+        element instanceof window.HTMLLIElement ||
+        element instanceof window.HTMLOptionElement
+      ) {
+        if (element instanceof window.HTMLInputElement) {
+          attributes.push({ name: "value", value: element.value });
+        } else if (typeof element.value === "string") {
+          const trimmedValue = element.value.trim();
+          if (trimmedValue) {
+            if (element instanceof window.HTMLInputElement) {
+              attributes.push({ name: "value", value: trimmedValue.replace(/\s+/g, ' ').trim() });
+            } else {
+              value = trimmedValue.replace(/\s+/g, ' ').trim();
+            }
+          }
+        } else if (typeof element.value === "number") {
+          value = element.value;
+        }
+      }
+
+      element.getAttributeNames().forEach((attribute: string) => {
+        const value = element.getAttribute(attribute);
+        if (value !== null) {
+          const trimmedValue = value.trim();
+          if (!trimmedValue) return
+          if (attribute === "role" && trimmedValue === "presentation") return
+          if (element.tagName === "BUTTON" && trimmedValue === "button") return
+          attributes.push({ name: attribute, value: trimmedValue.replace(/\s+/g, ' ').trim() })
+        }
+      });
+
+      let compressedElement = {
+        type: "element",
+        tagName: element.tagName,
+        attributes,
+        children: compressedChildren,
+        value: value
+      };
+
+      return {
+        compressedElement,
+      };
+    }
+
+    const idFunc = uniqueId();
+    // Call the function
+    const domTree = cleanupDom(window.document.body, window, idFunc);
+    return JSON.stringify({
+      domTree,
+    });
+  });
+}
+
 async function handleToolCall(name: string, args: any): Promise<CallToolResult> {
   const page = await ensureBrowser();
 
@@ -263,7 +391,7 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
 
     case "playwright_extract_dom":
       try {
-        const dom = await page.content();
+        const dom = await extractDom(page);
         fs.writeFileSync('/tmp/dom', dom);
         return {
           content: [{
