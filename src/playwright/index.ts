@@ -12,12 +12,14 @@ import {
   ImageContent,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import puppeteer, { Browser, Page } from "puppeteer";
+import { chromium, Browser, Page } from 'playwright';
+import fs from 'fs';
+import puppeteer from 'puppeteer';
 
 // Define the tools once to avoid repetition
 const TOOLS: Tool[] = [
   {
-    name: "puppeteer_navigate",
+    name: "playwright_navigate",
     description: "Navigate to a URL",
     inputSchema: {
       type: "object",
@@ -28,7 +30,7 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_screenshot",
+    name: "playwright_screenshot",
     description: "Take a screenshot of the current page or a specific element",
     inputSchema: {
       type: "object",
@@ -42,7 +44,7 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_click",
+    name: "playwright_click",
     description: "Click an element on the page",
     inputSchema: {
       type: "object",
@@ -53,7 +55,16 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_fill",
+    name: "playwright_extract_dom",
+    description: "Extract the DOM of the current page",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "playwright_fill",
     description: "Fill out an input field",
     inputSchema: {
       type: "object",
@@ -65,7 +76,7 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_select",
+    name: "playwright_select",
     description: "Select an element on the page with Select tag",
     inputSchema: {
       type: "object",
@@ -77,7 +88,7 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_hover",
+    name: "playwright_hover",
     description: "Hover an element on the page",
     inputSchema: {
       type: "object",
@@ -88,7 +99,7 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "puppeteer_evaluate",
+    name: "playwright_evaluate",
     description: "Execute JavaScript in the browser console",
     inputSchema: {
       type: "object",
@@ -108,9 +119,15 @@ const screenshots = new Map<string, string>();
 
 async function ensureBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({ headless: false });
-    const pages = await browser.pages();
-    page = pages[0];
+    const puppeteerChromiumPath = puppeteer.executablePath();
+
+    browser = await chromium.launch({
+      headless: false,
+      executablePath: puppeteerChromiumPath,
+    });
+
+    const context = await browser.newContext();
+    page = await context.newPage();
 
     page.on("console", (msg) => {
       const logEntry = `[${msg.type()}] ${msg.text()}`;
@@ -128,7 +145,7 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
   const page = await ensureBrowser();
 
   switch (name) {
-    case "puppeteer_navigate":
+    case "playwright_navigate":
       await page.goto(args.url);
       return {
         content: [{
@@ -138,14 +155,14 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         isError: false,
       };
 
-    case "puppeteer_screenshot": {
+    case "playwright_screenshot": {
       const width = args.width ?? 800;
       const height = args.height ?? 600;
-      await page.setViewport({ width, height });
+      await page.setViewportSize({ width, height });
 
-      const screenshot = await (args.selector ?
-        (await page.$(args.selector))?.screenshot({ encoding: "base64" }) :
-        page.screenshot({ encoding: "base64", fullPage: false }));
+      const item = page.locator(args.selector);
+      await item.waitFor();
+      const screenshot = (await item.screenshot()).toString('base64');
 
       if (!screenshot) {
         return {
@@ -157,7 +174,7 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         };
       }
 
-      screenshots.set(args.name, screenshot as string);
+      screenshots.set(args.name, screenshot);
       server.notification({
         method: "notifications/resources/list_changed",
       });
@@ -178,9 +195,11 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
       };
     }
 
-    case "puppeteer_click":
+    case "playwright_click":
       try {
-        await page.click(args.selector);
+        const item = page.locator(args.selector);
+        await item.waitFor();
+        await item.click();
         return {
           content: [{
             type: "text",
@@ -198,10 +217,11 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         };
       }
 
-    case "puppeteer_fill":
+    case "playwright_fill":
       try {
-        await page.waitForSelector(args.selector);
-        await page.type(args.selector, args.value);
+        const item = page.locator(args.selector);
+        await item.waitFor();
+        await item.fill(args.value);
         return {
           content: [{
             type: "text",
@@ -219,10 +239,11 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         };
       }
 
-    case "puppeteer_select":
+    case "playwright_select":
       try {
-        await page.waitForSelector(args.selector);
-        await page.select(args.selector, args.value);
+        const item = page.locator(args.selector);
+        await item.waitFor();
+        await item.selectOption(args.value);
         return {
           content: [{
             type: "text",
@@ -240,10 +261,32 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         };
       }
 
-    case "puppeteer_hover":
+    case "playwright_extract_dom":
       try {
-        await page.waitForSelector(args.selector);
-        await page.hover(args.selector);
+        const dom = await page.content();
+        fs.writeFileSync('/tmp/dom', dom);
+        return {
+          content: [{
+            type: "text",
+            text: dom,
+          }],
+          isError: false,
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to extract DOM: ${(error as Error).message}`,
+          }],
+          isError: true,
+        };
+      }
+      
+    case "playwright_hover":
+      try {
+        const item = page.locator(args.selector);
+        await item.waitFor();
+        await item.hover();
         return {
           content: [{
             type: "text",
@@ -261,7 +304,7 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
         };
       }
 
-    case "puppeteer_evaluate":
+    case "playwright_evaluate":
       try {
         const result = await page.evaluate((script) => {
           const logs: string[] = [];

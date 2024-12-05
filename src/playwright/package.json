@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.0.1",
+    "playwright": "^1.49.0",
     "puppeteer": "^23.4.0"
   },
   "devDependencies": {
