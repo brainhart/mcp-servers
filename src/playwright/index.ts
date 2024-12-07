@@ -36,7 +36,7 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         name: { type: "string", description: "Name for the screenshot" },
-        selector: { type: "string", description: "CSS selector for element to screenshot" },
+        selector: { type: "string", description: "Optional CSS selector for element to screenshot" },
         width: { type: "number", description: "Width in pixels (default: 800)" },
         height: { type: "number", description: "Height in pixels (default: 600)" },
       },
@@ -117,8 +117,8 @@ let page: Page | undefined;
 const consoleLogs: string[] = [];
 const screenshots = new Map<string, string>();
 
-async function ensureBrowser() {
-  if (!browser) {
+async function ensureBrowser(notify: (method: string, params: any) => void) {
+  if (!browser || !browser.isConnected()) {
     const puppeteerChromiumPath = puppeteer.executablePath();
 
     browser = await chromium.launch({
@@ -132,11 +132,9 @@ async function ensureBrowser() {
     page.on("console", (msg) => {
       const logEntry = `[${msg.type()}] ${msg.text()}`;
       consoleLogs.push(logEntry);
-      server.notification({
-        method: "notifications/resources/updated",
-        params: { uri: "console://logs" },
-      });
+      notify("notifications/resources/updated", { uri: "console://logs" });
     });
+
   }
   return page!;
 }
@@ -144,28 +142,28 @@ async function ensureBrowser() {
 async function extractDom(page: Page): Promise<string> {
   return await page.evaluate(() => {
     function uniqueId(): () => string {
-      let id = 0
+      let id = 0;
       return () => {
         id++;
         return id.toString();
-      }
+      };
     }
 
-    function cleanupDom(element: any, window: any, idFunc: () => string, currentSlotElement = null): { compressedElement: any } {
+    function cleanupDom(element: any, window: any, idFunc: () => string): any {
       if (element instanceof window.Text) {
-        const node = {
-          type: "text",
-          text: element.textContent?.replace(/\s+/g, ' ').trim(),
-        };
-
+        const textContent = element.textContent?.replace(/\s+/g, ' ').trim();
+        if (!textContent) {
+          return null; // Skip empty text nodes
+        }
         return {
-          compressedElement: node,
+          type: "text",
+          text: textContent,
         };
       }
 
       const elementId = idFunc();
+      element.setAttribute("mcp-id", elementId);
       const attributes: Array<{ name: string, value: string }> = [];
-      attributes.push({ name: "_id", value: elementId });
 
       if (
         element.tagName === "STYLE" ||
@@ -176,40 +174,23 @@ async function extractDom(page: Page): Promise<string> {
         element.tagName === "HEAD" ||
         element.tagName === "CODE" ||
         element.tagName === "SVG" ||
+        element.tagName === "FONT" ||
+        element.tagName === "BR" ||
+        // element.tagName === "SPAN" ||
         element.getAttribute("type") === "hidden" ||
         element.getAttribute("disabled") === "true" ||
         element.getAttribute("aria-hidden") === "true"
       ) {
-        return {
-          compressedElement: null,
-        };
+        return null;
       }
 
-      if (element.assignedSlot && element.assignedSlot !== currentSlotElement) {
-        return {
-          compressedElement: null,
-        };
+      if (element.assignedSlot) {
+        return null;
       }
 
       if (element.tagName === "IFRAME") {
         throw new Error("IFRAME not supported");
       }
-
-      let compressedChildren: { compressedElement: any }[] = [];
-      let childNodes = [...element.childNodes, ...(element.shadowRoot?.childNodes ?? [])];
-
-      if (element.tagName === "SLOT" && "assignedNodes" in element && typeof element.assignedNodes === "function") {
-        childNodes.push(...element.assignedNodes());
-      }
-
-      childNodes.forEach(child => {
-        if (child instanceof window.Text || child instanceof window.HTMLElement) {
-          const compressedChild = cleanupDom(child, window, idFunc, element.tagName === "SLOT" ? element : currentSlotElement);
-          if (compressedChild.compressedElement) {
-            compressedChildren.push(compressedChild.compressedElement);
-          }
-        }
-      });
 
       let value: string | number | null = null;
 
@@ -225,11 +206,7 @@ async function extractDom(page: Page): Promise<string> {
         } else if (typeof element.value === "string") {
           const trimmedValue = element.value.trim();
           if (trimmedValue) {
-            if (element instanceof window.HTMLInputElement) {
-              attributes.push({ name: "value", value: trimmedValue.replace(/\s+/g, ' ').trim() });
-            } else {
-              value = trimmedValue.replace(/\s+/g, ' ').trim();
-            }
+            value = trimmedValue.replace(/\s+/g, ' ').trim();
           }
         } else if (typeof element.value === "number") {
           value = element.value;
@@ -240,37 +217,66 @@ async function extractDom(page: Page): Promise<string> {
         const value = element.getAttribute(attribute);
         if (value !== null) {
           const trimmedValue = value.trim();
-          if (!trimmedValue) return
-          if (attribute === "role" && trimmedValue === "presentation") return
-          if (element.tagName === "BUTTON" && trimmedValue === "button") return
-          attributes.push({ name: attribute, value: trimmedValue.replace(/\s+/g, ' ').trim() })
+          if (!trimmedValue) return;
+          if (attribute === "role" && trimmedValue === "presentation") return;
+          if (element.tagName === "BUTTON" && trimmedValue === "button") return;
+          attributes.push({ name: attribute, value: trimmedValue.replace(/\s+/g, ' ').trim() });
         }
       });
 
-      let compressedElement = {
+      return {
         type: "element",
         tagName: element.tagName,
         attributes,
-        children: compressedChildren,
+        children: [],
         value: value
-      };
-
-      return {
-        compressedElement,
       };
     }
 
     const idFunc = uniqueId();
-    // Call the function
-    const domTree = cleanupDom(window.document.body, window, idFunc);
-    return JSON.stringify({
-      domTree,
-    });
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, null);
+    const root = cleanupDom(document.body, window, idFunc);
+    const stack = [{ node: root, walkerNode: walker.currentNode }];
+
+    while (stack.length > 0) {
+      const { node, walkerNode } = stack.pop()!;
+      walker.currentNode = walkerNode;
+
+      let child = walker.firstChild();
+      while (child) {
+        const childNode = cleanupDom(child, window, idFunc);
+        if (childNode) {
+          node.children.push(childNode);
+          stack.push({ node: childNode, walkerNode: child });
+        }
+        child = walker.nextSibling();
+      }
+    }
+
+    function prettyPrintDom(node: any, depth: number = 0): string {
+      const indent = '\t'.repeat(Math.floor(depth / 2));
+
+      if (node.type === "text") {
+        return `${indent}${node.text}`;
+      }
+
+      const attributes = node.attributes.map((attr: { name: string, value: string }) => `${attr.name}="${attr.value}"`).join(" ");
+      
+      // Special handling for <a> tags to keep them on a single line if they contain only text
+      if (node.tagName.toLowerCase() === "a" && node.children.length === 1 && node.children[0].type === "text") {
+        return `${indent}<${node.tagName.toLowerCase()} ${attributes}>${node.children[0].text}</${node.tagName.toLowerCase()}>`;
+      }
+
+      const children = node.children.map((child: any) => prettyPrintDom(child, depth + 1)).join("\n");
+
+      return `${indent}<${node.tagName.toLowerCase()} ${attributes}>\n${children}\n${indent}</${node.tagName.toLowerCase()}>`;
+    }
+    return prettyPrintDom(root);
   });
 }
 
-async function handleToolCall(name: string, args: any): Promise<CallToolResult> {
-  const page = await ensureBrowser();
+async function handleToolCall(name: string, args: any, notify: (method: string, params: any) => void): Promise<CallToolResult> {
+  const page = await ensureBrowser(notify);
 
   switch (name) {
     case "playwright_navigate":
@@ -288,8 +294,13 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
       const height = args.height ?? 600;
       await page.setViewportSize({ width, height });
 
-      const item = page.locator(args.selector);
-      await item.waitFor();
+      let item;
+      if (args.selector) {
+        item = page.locator(args.selector);
+        await item.waitFor();
+      } else {
+        item = page;
+      }
       const screenshot = (await item.screenshot()).toString('base64');
 
       if (!screenshot) {
@@ -303,9 +314,7 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
       }
 
       screenshots.set(args.name, screenshot);
-      server.notification({
-        method: "notifications/resources/list_changed",
-      });
+      notify("notifications/resources/list_changed", null);
 
       return {
         content: [
@@ -392,7 +401,13 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
     case "playwright_extract_dom":
       try {
         const dom = await extractDom(page);
-        fs.writeFileSync('/tmp/dom', dom);
+        const domSizeInBytes = new TextEncoder().encode(dom).length;
+
+        if (domSizeInBytes > 1048576) {
+          console.error(JSON.stringify({ dom_size_bytes: domSizeInBytes, url: page.url() }));
+          console.error(dom);
+        }
+
         return {
           content: [{
             type: "text",
@@ -485,77 +500,127 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
   }
 }
 
-const server = new Server(
-  {
-    name: "example-servers/puppeteer",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {},
-    },
-  },
-);
-
-
-// Setup request handlers
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-  resources: [
+export const createServer = () => {
+  const server = new Server(
     {
-      uri: "console://logs",
-      mimeType: "text/plain",
-      name: "Browser console logs",
+      name: "example-servers/puppeteer",
+      version: "0.1.0",
     },
-    ...Array.from(screenshots.keys()).map(name => ({
-      uri: `screenshot://${name}`,
-      mimeType: "image/png",
-      name: `Screenshot: ${name}`,
-    })),
-  ],
-}));
+    {
+      capabilities: {
+        resources: {},
+        tools: {},
+      },
+    },
+  );
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const uri = request.params.uri.toString();
+  const notify = (method: string, params: any) => {
+    server.notification({ method, params });
+  };
 
-  if (uri === "console://logs") {
-    return {
-      contents: [{
-        uri,
+  // Setup request handlers
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
+      {
+        uri: "console://logs",
         mimeType: "text/plain",
-        text: consoleLogs.join("\n"),
-      }],
-    };
-  }
+        name: "Browser console logs",
+      },
+      ...Array.from(screenshots.keys()).map(name => ({
+        uri: `screenshot://${name}`,
+        mimeType: "image/png",
+        name: `Screenshot: ${name}`,
+      })),
+    ],
+  }));
 
-  if (uri.startsWith("screenshot://")) {
-    const name = uri.split("://")[1];
-    const screenshot = screenshots.get(name);
-    if (screenshot) {
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const uri = request.params.uri.toString();
+
+    if (uri === "console://logs") {
       return {
         contents: [{
           uri,
-          mimeType: "image/png",
-          blob: screenshot,
+          mimeType: "text/plain",
+          text: consoleLogs.join("\n"),
         }],
       };
     }
-  }
 
-  throw new Error(`Resource not found: ${uri}`);
-});
+    if (uri.startsWith("screenshot://")) {
+      const name = uri.split("://")[1];
+      const screenshot = screenshots.get(name);
+      if (screenshot) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "image/png",
+            blob: screenshot,
+          }],
+        };
+      }
+    }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+    throw new Error(`Resource not found: ${uri}`);
+  });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) =>
-  handleToolCall(request.params.name, request.params.arguments ?? {})
-);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOLS,
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) =>
+    handleToolCall(request.params.name, request.params.arguments ?? {}, notify)
+  );
+
+  return server;
+};
 
 async function runServer() {
+  console.log("Starting server...");
+  const server = createServer();
+
+  server.onclose = () => {
+    console.error("Server closed, exiting process...");
+    process.exit(0);
+  };
+
   const transport = new StdioServerTransport();
+
   await server.connect(transport);
+
+  console.error("Server connected");
+
+  // Periodically ping the server every 30 seconds
+  setInterval(async () => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await server.ping();
+        console.log("Server ping successful");
+        break; // Exit the loop if ping is successful
+      } catch (error) {
+        if (attempt < 3) {
+          console.error(`Server ping failed, attempt ${attempt} of 3. Retrying in 1s...`);
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for 1 second before retrying
+        } else {
+          console.error("Server ping failed after 3 attempts, exiting process...");
+          process.exit(1);
+        }
+      }
+    }
+  }, 5000);
+
+
+  // Ensure browser is closed on process exit
+  process.on('exit', async () => {
+    console.error("Closing browser...");
+    if (browser) {
+      browser.close();
+    }
+    server.close();
+  });
 }
+
+
+
 
 runServer().catch(console.error);
